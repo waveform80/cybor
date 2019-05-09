@@ -19,46 +19,23 @@ class CBOREncodeError(ValueError):
 
 def shareable_encoder(func):
     """
-    Wrap the given encoder function to gracefully handle cyclic data structures.
+    Decorator wrapping an encoder method to handle cyclic data structures (or
+    general scalar value sharing).
 
-    If value sharing is enabled, this marks the given value shared in the datastream on the
-    first call. If the value has already been passed to this method, a reference marker is
-    instead written to the data stream and the wrapped function is not called.
+    If value sharing is enabled, this marks the given value shared in the
+    output stream on the first call. If the value has already been passed to
+    this method, a reference marker is instead written to the data stream and
+    the wrapped method is not called.
 
     If value sharing is disabled, only infinite recursion protection is done.
-
     """
     @wraps(func)
-    def wrapper(self, value):
-        value_id = id(value)
-        container, container_index = self._shared.get(value_id, (None, None))
-        if self.value_sharing:
-            if container is value:
-                # Generate a reference to the previous index instead of
-                # encoding this again
-                self.encode_length(0xd8, 0x1d)
-                self.encode_int(container_index)
-            else:
-                # Mark the object as shareable
-                self._shared[value_id] = (value, len(self._shared))
-                self.encode_length(0xd8, 0x1c)
-                func(self, value)
-        else:
-            if container is value:
-                raise CBOREncodeError(
-                    'cyclic data structure detected but value sharing is '
-                    'disabled')
-            else:
-                self._shared[value_id] = (value, None)
-                try:
-                    func(self, value)
-                finally:
-                    del self._shared[value_id]
-
+    def wrapper(encoder, value):
+        encoder.encode_shared(func, value)
     return wrapper
 
 
-class CBOREncoder():
+cdef class CBOREncoder:
     """
     Serializes objects to a byte stream using Concise Binary Object
     Representation.
@@ -77,27 +54,31 @@ class CBOREncoder():
         value, file object) when no suitable encoder has been found, and should
         use the methods on the encoder to encode any objects it wants to add to
         the data stream
-    :param canonical:
+    :param bool canonical:
         Forces mapping types to be output in a stable order to guarantee that
         the output will always produce the same hash given the same input.
     """
+    cdef object _write
+    cdef object _encoders
+    cdef dict _shared
+    cdef object _timezone
+    cdef bint _datetime_as_timestamp
+    cdef bint _value_sharing
+    cdef object _default_handler
 
-    __slots__ = ('fp', 'datetime_as_timestamp', 'timezone', 'default',
-                 'value_sharing', '_shared', '_encoders')
-
-    def __init__(self, fp, datetime_as_timestamp=False, timezone=None,
+    def __cinit__(self, fp, datetime_as_timestamp=False, timezone=None,
                  value_sharing=False, default=None, canonical=False):
         self.fp = fp
-        self.datetime_as_timestamp = datetime_as_timestamp
-        self.timezone = timezone
-        self.value_sharing = value_sharing
-        self.default = default
         self._shared = {}  # indexes used for value sharing
         self._encoders = default_encoders.copy()
+        self._value_sharing = value_sharing
+        self._datetime_as_timestamp = datetime_as_timestamp
+        self._timezone = timezone
+        self._default_handler = default
         if canonical:
             self._encoders.update(canonical_encoders)
 
-    def _find_encoder(self, obj_type):
+    cdef object _find_encoder(self, object obj_type):
         from sys import modules
 
         for type_, enc in list(self._encoders.items()):
@@ -115,67 +96,160 @@ class CBOREncoder():
                 self._encoders[obj_type] = enc
                 return enc
 
+    #
+    # Property accessors
+    #
+
+    @property
+    def datetime_as_timestamp(self):
+        return self._datetime_as_timestamp
+
+    @datetime_as_timestamp.setter
+    def datetime_as_timestamp(self, value):
+        self._datetime_as_timestamp = bool(value)
+
+    @property
+    def value_sharing(self):
+        return self._value_sharing
+
+    @value_sharing.setter
+    def value_sharing(self, value):
+        self._value_sharing = bool(value)
+
+    @property
+    def timezone(self):
+        return self._timezone
+
+    @timezone.setter
+    def timezone(self, value):
+        self._timezone = value
+
+    @property
+    def fp(self):
+        return self._write.__self__
+
+    @fp.setter
+    def fp(self, value):
+        if callable(value.write):
+            self._write = value.write
+        else:
+            raise ValueError('fp must have a callable write method')
+
+    #
+    # Utility I/O methods
+    #
+
     def write(self, data):
         """
         Write bytes to the data stream.
 
         :param bytes data: the bytes to write
         """
-        self.fp.write(data)
+        self._write(data)
+
+    cdef void _encode_length(self, int major_tag, unsigned long long length):
+        major_tag <<= 5
+        if length < 24:
+            self._write(struct.pack('>B', major_tag | length))
+        elif length < 256:
+            self._write(struct.pack('>BB', major_tag | 24, length))
+        elif length < 65536:
+            self._write(struct.pack('>BH', major_tag | 25, length))
+        elif length < 4294967296:
+            self._write(struct.pack('>BL', major_tag | 26, length))
+        else:
+            self._write(struct.pack('>BQ', major_tag | 27, length))
 
     def encode_length(self, major_tag, length):
-        if length < 24:
-            self.write(struct.pack('>B', major_tag | length))
-        elif length < 256:
-            self.write(struct.pack('>BB', major_tag | 24, length))
-        elif length < 65536:
-            self.write(struct.pack('>BH', major_tag | 25, length))
-        elif length < 4294967296:
-            self.write(struct.pack('>BL', major_tag | 26, length))
-        else:
-            self.write(struct.pack('>BQ', major_tag | 27, length))
+        self._encode_length(major_tag, length)
 
-    def encode_int(self, value):
+    cdef int _encode_shared(self, object encoder, object value) except -1:
+        cdef unsigned long long value_id
+        cdef Py_ssize_t index
+
+        value_id = id(value)
+        try:
+            index = self._shared[value_id][1]
+        except KeyError:
+            if self._value_sharing:
+                self._shared[value_id] = (value, len(self._shared))
+                self._encode_length(6, 28)
+                encoder(self, value)
+            else:
+                self._shared[value_id] = (value, 0)
+                try:
+                    encoder(self, value)
+                finally:
+                    del self._shared[value_id]
+        else:
+            if self._value_sharing:
+                self._encode_length(6, 29)
+                self._encode_int(index)
+            else:
+                raise CBOREncodeError("cyclic data structure detected but "
+                                      "value_sharing is False") from None
+        return 0
+
+    def encode_shared(self, encoder, value):
+        self._encode_shared(encoder, value)
+
+    #
+    # Major encoders
+    #
+
+    cdef _encode_int(self, value):
         # Big integers (2 ** 64 and over)
         if value >= 18446744073709551616 or value < -18446744073709551616:
             if value >= 0:
-                major_type = 0x02
+                semantic_type = 2
             else:
-                major_type = 0x03
+                semantic_type = 3
                 value = -value - 1
 
             bits = value.bit_length()
             payload = value.to_bytes((bits + 7) // 8, 'big')
-            self.encode_semantic(CBORTag(major_type, payload))
+            self.encode_semantic(CBORTag(semantic_type, payload))
         elif value >= 0:
-            self.encode_length(0, value)
+            self._encode_length(0, <unsigned long long>value)
         else:
-            self.encode_length(0x20, -(value + 1))
+            self._encode_length(1, <unsigned long long>-(value + 1))
+
+    def encode_int(self, value):
+        self._encode_int(value)
 
     def encode_bytestring(self, value):
-        self.encode_length(0x40, len(value))
-        self.write(value)
+        self._encode_length(2, len(value))
+        self._write(value)
 
     def encode_bytearray(self, value):
         self.encode_bytestring(bytes(value))
 
     def encode_string(self, value):
         buf = value.encode('utf-8')
-        self.encode_length(0x60, len(buf))
-        self.write(buf)
+        self._encode_length(3, len(buf))
+        self._write(buf)
 
     @shareable_encoder
     def encode_array(self, value):
-        self.encode_length(0x80, len(value))
+        self._encode_length(4, len(value))
         for item in value:
             self.encode(item)
 
-    @shareable_encoder
-    def encode_map(self, value):
-        self.encode_length(0xa0, len(value))
+    cdef encode_dict(self, dict value):
+        self._encode_length(5, len(value))
         for key, val in value.items():
             self.encode(key)
             self.encode(val)
+
+    @shareable_encoder
+    def encode_map(self, value):
+        if type(value) == dict:
+            self.encode_dict(<dict>value)
+        else:
+            self._encode_length(5, len(value))
+            for key, val in value.items():
+                self.encode(key)
+                self.encode(val)
 
     def _encode_sortable_key(self, value):
         """
@@ -192,17 +266,17 @@ class CBOREncoder():
             (self._encode_sortable_key(key), (key, value))
             for key, value in value.items()
         )
-        self.encode_length(0xa0, len(value))
+        self._encode_length(5, len(value))
         for (length, encoded), (key, value) in sorted(keyed_list):
-            self.write(encoded)
+            self._write(encoded)
             self.encode(value)
 
     def encode_semantic(self, value):
-        self.encode_length(0xc0, value.tag)
+        self._encode_length(6, value.tag)
         self.encode(value.value)
 
     #
-    # Semantic decoders (major tag 6)
+    # Semantic encoders (major tag 6)
     #
 
     def encode_datetime(self, value):
@@ -229,9 +303,9 @@ class CBOREncoder():
     def encode_decimal(self, value):
         # Semantic tag 4
         if value.is_nan():
-            self.write(b'\xf9\x7e\x00')
+            self._write(b'\xf9\x7e\x00')
         elif value.is_infinite():
-            self.write(b'\xf9\x7c\x00' if value > 0 else b'\xf9\xfc\x00')
+            self._write(b'\xf9\x7c\x00' if value > 0 else b'\xf9\xfc\x00')
         else:
             dt = value.as_tuple()
             sig = 0
@@ -271,24 +345,28 @@ class CBOREncoder():
         )
         self.encode_semantic(CBORTag(258, tuple(key[0][1] for key in values)))
 
+    def encode_ipaddress(self, value):
+        # Semantic tag 260
+        self.encode_semantic(CBORTag(260, value.packed))
+
     #
     # Special encoders (major tag 7)
     #
 
     def encode_simple_value(self, value):
         if value.value < 20:
-            self.write(struct.pack('>B', 0xe0 | value.value))
+            self._write(struct.pack('>B', 0xe0 | value.value))
         else:
-            self.write(struct.pack('>BB', 0xf8, value.value))
+            self._write(struct.pack('>BB', 0xf8, value.value))
 
     def encode_float(self, value):
         # Handle special values efficiently
         if math.isnan(value):
-            self.write(b'\xf9\x7e\x00')
+            self._write(b'\xf9\x7e\x00')
         elif math.isinf(value):
-            self.write(b'\xf9\x7c\x00' if value > 0 else b'\xf9\xfc\x00')
+            self._write(b'\xf9\x7c\x00' if value > 0 else b'\xf9\xfc\x00')
         else:
-            self.write(struct.pack('>Bd', 0xfb, value))
+            self._write(struct.pack('>Bd', 0xfb, value))
 
     def encode_minimal_float(self, value):
         # Handle special values efficiently
@@ -296,13 +374,13 @@ class CBOREncoder():
         self.encode_float(value)
 
     def encode_boolean(self, value):
-        self.write(b'\xf5' if value else b'\xf4')
+        self._write(b'\xf5' if value else b'\xf4')
 
     def encode_none(self, value):
-        self.write(b'\xf6')
+        self._write(b'\xf6')
 
     def encode_undefined(self, value):
-        self.write(b'\xf7')
+        self._write(b'\xf7')
 
     @contextmanager
     def disable_value_sharing(self):
@@ -315,7 +393,7 @@ class CBOREncoder():
         yield
         self.value_sharing = old_value_sharing
 
-    def encode(self, obj):
+    cdef int _encode(self, object obj) except -1:
         """
         Encode the given object using CBOR.
 
@@ -325,12 +403,16 @@ class CBOREncoder():
         encoder = (
             self._encoders.get(obj_type) or
             self._find_encoder(obj_type) or
-            self.default
+            self.default_handler
         )
         if not encoder:
             raise CBOREncodeError('cannot serialize type %s' % obj_type.__name__)
 
         encoder(self, obj)
+        return 0
+
+    def encode(self, obj):
+        self._encode(obj)
 
     def encode_to_bytes(self, obj):
         """
@@ -355,7 +437,6 @@ default_encoders = OrderedDict([
     (bytearray,                     CBOREncoder.encode_bytearray),
     (unicode,                       CBOREncoder.encode_string),
     (int,                           CBOREncoder.encode_int),
-    (long,                          CBOREncoder.encode_int),
     (float,                         CBOREncoder.encode_float),
     (('decimal', 'Decimal'),        CBOREncoder.encode_decimal),
     (bool,                          CBOREncoder.encode_boolean),
@@ -373,6 +454,8 @@ default_encoders = OrderedDict([
     (('fractions', 'Fraction'),     CBOREncoder.encode_rational),
     (('email.message', 'Message'),  CBOREncoder.encode_mime),
     (('uuid', 'UUID'),              CBOREncoder.encode_uuid),
+    (('ipaddress', 'IPv4Address'),  CBOREncoder.encode_ipaddress),
+    (('ipaddress', 'IPv6Address'),  CBOREncoder.encode_ipaddress),
     (CBORSimpleValue,               CBOREncoder.encode_simple_value),
     (CBORTag,                       CBOREncoder.encode_semantic),
     (set,                           CBOREncoder.encode_set),
@@ -418,4 +501,3 @@ def dump(obj, fp, **kwargs):
         keyword arguments passed to :class:`CBOREncoder`
     """
     CBOREncoder(fp, **kwargs).encode(obj)
-

@@ -15,7 +15,7 @@ class CBORDecodeError(ValueError):
     """
 
 
-class CBORDecoder():
+cdef class CBORDecoder:
     """
     Deserializes a CBOR encoded byte stream.
 
@@ -31,17 +31,57 @@ class CBORDecoder():
         object. The return value is substituted for the dict in the
         deserialized output.
     """
+    cdef object _fp_read
+    cdef object _tag_hook
+    cdef object _object_hook
+    cdef Py_ssize_t _share_index
+    cdef list _shareables
+    cdef bint _immutable
 
-    __slots__ = ('fp', 'tag_hook', 'object_hook', '_shared_index',
-                 '_shareables', '_immutable')
-
-    def __init__(self, fp, tag_hook=None, object_hook=None):
+    def __cinit__(self, fp, tag_hook=None, object_hook=None):
         self.fp = fp
-        self.tag_hook = tag_hook
-        self.object_hook = object_hook
-        self._share_index = None
+        self._tag_hook = tag_hook
+        self._object_hook = object_hook
+        self._share_index = -1
         self._shareables = []
         self._immutable = False
+
+    #
+    # Property accessors
+    #
+
+    @property
+    def fp(self):
+        return self._fp_read.__self__
+
+    @fp.setter
+    def fp(self, value):
+        if callable(value.read):
+            self._fp_read = value.read
+        else:
+            raise ValueError('fp must have a callable read method')
+
+    @property
+    def tag_hook(self):
+        return self._tag_hook
+
+    @tag_hook.setter
+    def tag_hook(self, value):
+        if value is None or callable(value):
+            self._tag_hook = value
+        else:
+            raise ValueError('tag_hook must be None or a callable')
+
+    @property
+    def object_hook(self):
+        return self._object_hook
+
+    @object_hook.setter
+    def object_hook(self, value):
+        if value is None or callable(value):
+            self._object_value = value
+        else:
+            raise ValueError('object_hook must be None or a callable')
 
     @property
     def immutable(self):
@@ -52,16 +92,17 @@ class CBORDecoder():
         """
         return self._immutable
 
-    def _set_shareable(self, value):
-        """
-        Set the shareable value for the last encountered shared value marker,
-        if any.
+    #
+    # Utility I/O methods
+    #
 
-        :param object value:
-            the shared value
-        """
-        if self._share_index is not None:
-            self._shareables[self._share_index] = value
+    cdef object _read(self, Py_ssize_t amount):
+        data = self._fp_read(amount)
+        if len(data) < amount:
+            raise CBORDecodeError(
+                'premature end of stream (expected to read {} bytes, got {} '
+                'instead)'.format(amount, len(data)))
+        return data
 
     def read(self, amount):
         """
@@ -70,116 +111,140 @@ class CBORDecoder():
         :param int amount:
             the number of bytes to read
         """
-        data = self.fp.read(amount)
-        if len(data) < amount:
-            raise CBORDecodeError(
-                'premature end of stream (expected to read {} bytes, got {} '
-                'instead)'.format(amount, len(data)))
+        return self._read(amount)
 
-        return data
+    cdef void _set_shareable(self, object value):
+        """
+        Set the shareable value for the last encountered shared value marker,
+        if any.
 
-    def decode_length(self, subtype, allow_indefinite=False):
+        :param object value:
+            the shared value
+        """
+        if self._share_index != -1:
+            self._shareables[self._share_index] = value
+
+    #
+    # Major decoders
+    #
+
+    cdef object _decode_length(self, int subtype, bint allow_indefinite=False):
         # Major tag 0
         if subtype < 24:
             return subtype
         elif subtype == 24:
-            return struct.unpack('>B', self.read(1))[0]
+            return self._read(1)[0]
         elif subtype == 25:
-            return struct.unpack('>H', self.read(2))[0]
+            return struct.unpack('>H', self._read(2))[0]
         elif subtype == 26:
-            return struct.unpack('>L', self.read(4))[0]
+            return struct.unpack('>L', self._read(4))[0]
         elif subtype == 27:
-            return struct.unpack('>Q', self.read(8))[0]
+            return struct.unpack('>Q', self._read(8))[0]
         elif subtype == 31 and allow_indefinite:
             return None
         else:
-            raise CBORDecodeError('unknown unsigned integer subtype 0x%x' % subtype)
+            raise CBORDecodeError(
+                'unknown unsigned integer subtype 0x%x' % subtype)
+
+    def decode_length(self, subtype, allow_indefinite=False):
+        return self._decode_length(subtype, allow_indefinite)
 
     def decode_uint(self, subtype):
         # Major tag 0
-        return self.decode_length(subtype)
+        return self._decode_length(subtype)
 
     def decode_negint(self, subtype):
         # Major tag 1
-        return -self.decode_length(subtype) - 1
+        return -self._decode_length(subtype) - 1
 
     def decode_bytestring(self, subtype):
         # Major tag 2
-        length = self.decode_length(subtype, allow_indefinite=True)
+        length = self._decode_length(subtype, allow_indefinite=True)
         if length is None:
             # Indefinite length
             buf = []
             while True:
-                initial_byte = self.read(1)[0]
+                initial_byte = self._read(1)[0]
                 if initial_byte == 0xff:
                     return b''.join(buf)
                 else:
-                    length = self.decode_uint(initial_byte & 31)
-                    buf.append(self.read(length))
+                    length = self._decode_length(initial_byte & 0x1f)
+                    buf.append(self._read(length))
         else:
-            return self.read(length)
+            return self._read(length)
 
     def decode_string(self, subtype):
         # Major tag 3
         return self.decode_bytestring(subtype).decode('utf-8')
 
-    def decode_array(self, subtype):
-        # Major tag 4
-        items = []
-        self._set_shareable(items)
-        length = self.decode_length(subtype, allow_indefinite=True)
+    cdef list _decode_array(self, int subtype):
+        cdef list items
+
+        length = self._decode_length(subtype, allow_indefinite=True)
         if length is None:
             # Indefinite length
+            items = []
+            self._set_shareable(items)
             while True:
-                value = self.decode()
+                value = self._decode(immutable=False, unshared=True)
                 if value is break_marker:
                     break
                 else:
                     items.append(value)
         else:
             items = [None] * length
+            self._set_shareable(items)
             for i in range(length):
-                items[i] = self.decode()
+                items[i] = self._decode(immutable=False, unshared=True)
 
         if self.immutable:
             items = tuple(items)
             self._set_shareable(items)
         return items
 
-    def decode_map(self, subtype):
-        # Major tag 5
+    def decode_array(self, subtype):
+        # Major tag 4
+        return self._decode_array(subtype)
+
+    cdef dict _decode_map(self, int subtype):
+        cdef dict dictionary
+
         dictionary = {}
         self._set_shareable(dictionary)
-        length = self.decode_length(subtype, allow_indefinite=True)
+        length = self._decode_length(subtype, allow_indefinite=True)
         if length is None:
             # Indefinite length
             while True:
-                key = self._decode_immutable()
+                key = self._decode(immutable=True, unshared=True)
                 if key is break_marker:
                     break
                 else:
-                    dictionary[key] = self.decode()
+                    dictionary[key] = self._decode(immutable=False, unshared=True)
         else:
             for _ in range(length):
-                key = self._decode_immutable()
-                dictionary[key] = self.decode()
+                key = self._decode(immutable=True, unshared=True)
+                dictionary[key] = self._decode(immutable=False, unshared=True)
 
         if self.object_hook:
-            dictionary = self.object_hook(self, dictionary)
+            dictionary = self._object_hook(self, dictionary)
             self._set_shareable(dictionary)
         elif self.immutable:
             dictionary = FrozenDict(dictionary)
             self._set_shareable(dictionary)
         return dictionary
 
+    def decode_map(self, subtype):
+        # Major tag 5
+        return self._decode_map(subtype)
+
     def decode_semantic(self, subtype):
         # Major tag 6
-        tagnum = self.decode_length(subtype)
+        tagnum = self._decode_length(subtype)
         semantic_decoder = semantic_decoders.get(tagnum)
         if semantic_decoder:
             return semantic_decoder(self)
         else:
-            tag = CBORTag(tagnum, self.decode())
+            tag = CBORTag(tagnum, self._decode(immutable=False, unshared=True))
             if self.tag_hook:
                 return self.tag_hook(tag)
             else:
@@ -192,14 +257,13 @@ class CBORDecoder():
         # Major tag 7
         return special_decoders[subtype](self)
 
-
     #
     # Semantic decoders (major tag 6)
     #
 
     def decode_datetime_string(self):
         # Semantic tag 0
-        value = self.decode()
+        value = self._decode()
         match = timestamp_re.match(value)
         if match:
             (
@@ -226,12 +290,12 @@ class CBORDecoder():
 
     def decode_epoch_datetime(self):
         # Semantic tag 1
-        value = self.decode()
+        value = self._decode()
         return datetime.fromtimestamp(value, timezone.utc)
 
     def decode_positive_bignum(self):
         # Semantic tag 2
-        value = self.decode()
+        value = self._decode()
         return int.from_bytes(value, 'big')
 
     def decode_negative_bignum(self):
@@ -241,13 +305,13 @@ class CBORDecoder():
     def decode_fraction(self):
         # Semantic tag 4
         from decimal import Decimal
-        exp, sig = self.decode()
+        exp, sig = self._decode()
         return sig * (10 ** exp)
 
     def decode_bigfloat(self):
         # Semantic tag 5
         from decimal import Decimal
-        exp, sig = self.decode()
+        exp, sig = self._decode()
         return sig * (2 ** exp)
 
     def decode_shareable(self):
@@ -256,13 +320,13 @@ class CBORDecoder():
         self._share_index = len(self._shareables)
         self._shareables.append(None)
         try:
-            return self.decode()
+            return self._decode()
         finally:
             self._share_index = old_index
 
     def decode_sharedref(self):
         # Semantic tag 29
-        value = self.decode()
+        value = self._decode()
         try:
             shared = self._shareables[value]
         except IndexError:
@@ -276,45 +340,74 @@ class CBORDecoder():
     def decode_rational(self):
         # Semantic tag 30
         from fractions import Fraction
-        return Fraction(*self.decode())
+        return Fraction(*self._decode())
 
     def decode_regexp(self):
         # Semantic tag 35
-        return re.compile(self.decode())
+        return re.compile(self._decode())
 
     def decode_mime(self):
         # Semantic tag 36
         from email.parser import Parser
-        return Parser().parsestr(self.decode())
+        return Parser().parsestr(self._decode())
 
     def decode_uuid(self):
         # Semantic tag 37
         from uuid import UUID
-        return UUID(bytes=self.decode())
+        return UUID(bytes=self._decode())
 
     def decode_set(self):
         # Semantic tag 258
         if self.immutable:
-            return frozenset(self._decode_immutable())
+            return frozenset(self._decode(immutable=True))
         else:
-            return set(self._decode_immutable())
+            return set(self._decode(immutable=True))
+
+    def decode_ipaddress(self):
+        # Semantic tag 260
+        from ipaddress import ip_address
+        buf = self.decode()
+        if len(buf) in (4, 16):
+            return ip_address(buf)
+        elif len(buf) == 6:
+            # MAC address
+            return CBORTag(260, buf)
+        else:
+            raise CBORDecodeError("invalid ipaddress value %r" % buf)
 
     #
     # Special decoders (major tag 7)
     #
 
     def decode_simple_value(self):
-        return CBORSimpleValue(self.read(1)[0])
+        return CBORSimpleValue(self._read(1)[0])
 
     def decode_float16(self):
         # TODO re-write with C half-float implementation
-        return struct.unpack('>f', self.read(4))[0]
+        return struct.unpack('>f', self._read(4))[0]
 
     def decode_float32(self):
-        return struct.unpack('>f', self.read(4))[0]
+        return struct.unpack('>f', self._read(4))[0]
 
     def decode_float64(self):
-        return struct.unpack('>d', self.read(8))[0]
+        return struct.unpack('>d', self._read(8))[0]
+
+    cdef object _decode(self, bint immutable=False, bint unshared=False):
+        cdef int initial_byte
+
+        if immutable:
+            old_immutable = self._immutable
+            self._immutable = True
+        if unshared:
+            old_index = self._share_index
+            self._share_index = -1
+        initial_byte = self._read(1)[0]
+        result = major_decoders[initial_byte >> 5](self, initial_byte & 31)
+        if unshared:
+            self._share_index = old_index
+        if immutable:
+            self._immutable = old_immutable
+        return result
 
     def decode(self):
         """
@@ -322,18 +415,7 @@ class CBORDecoder():
 
         :raises CBORDecodeError: if there is any problem decoding the stream
         """
-        initial_byte = self.fp.read(1)[0]
-        major_type = initial_byte >> 5
-        subtype = initial_byte & 31
-        return major_decoders[major_type](self, subtype)
-
-    def _decode_immutable(self):
-        old_immutable = self.immutable
-        self._immutable = True
-        try:
-            return self.decode()
-        finally:
-            self._immutable = old_immutable
+        return self._decode()
 
     def decode_from_bytes(self, buf):
         """
@@ -388,7 +470,8 @@ semantic_decoders = {
     35:  CBORDecoder.decode_regexp,
     36:  CBORDecoder.decode_mime,
     37:  CBORDecoder.decode_uuid,
-    258: CBORDecoder.decode_set
+    258: CBORDecoder.decode_set,
+    260: CBORDecoder.decode_ipaddress,
 }
 
 
