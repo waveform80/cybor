@@ -147,7 +147,7 @@ cdef class CBOREncoder:
         """
         self._write(data)
 
-    cdef void _encode_length(self, int major_tag, unsigned long long length):
+    cdef void _encode_length(self, unsigned char major_tag, unsigned long long length):
         major_tag <<= 5
         if length < 24:
             self._write(struct.pack('>B', major_tag | length))
@@ -355,7 +355,7 @@ cdef class CBOREncoder:
 
     def encode_simple_value(self, value):
         if value.value < 20:
-            self._write(struct.pack('>B', 0xe0 | value.value))
+            self._write(0xe0 | value.value)
         else:
             self._write(struct.pack('>BB', 0xf8, value.value))
 
@@ -399,7 +399,7 @@ cdef class CBOREncoder:
 
         :param object obj: the object to encode
         """
-        obj_type = obj.__class__
+        obj_type = type(obj)
         encoder = (
             self._encoders.get(obj_type) or
             self._find_encoder(obj_type) or

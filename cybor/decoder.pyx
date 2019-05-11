@@ -1,5 +1,6 @@
 import re
 import struct
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -186,7 +187,8 @@ cdef class CBORDecoder:
             items = []
             self._set_shareable(items)
             while True:
-                value = self._decode(immutable=False, unshared=True)
+                with self.disable_value_sharing:
+                    value = self._decode()
                 if value is break_marker:
                     break
                 else:
@@ -195,7 +197,8 @@ cdef class CBORDecoder:
             items = [None] * length
             self._set_shareable(items)
             for i in range(length):
-                items[i] = self._decode(immutable=False, unshared=True)
+                with self.disable_value_sharing:
+                    items[i] = self._decode()
 
         if self.immutable:
             items = tuple(items)
@@ -215,15 +218,19 @@ cdef class CBORDecoder:
         if length is None:
             # Indefinite length
             while True:
-                key = self._decode(immutable=True, unshared=True)
+                with self.immutable_value, self.disable_value_sharing:
+                    key = self._decode()
                 if key is break_marker:
                     break
                 else:
-                    dictionary[key] = self._decode(immutable=False, unshared=True)
+                    with self.disable_value_sharing:
+                        dictionary[key] = self._decode()
         else:
             for _ in range(length):
-                key = self._decode(immutable=True, unshared=True)
-                dictionary[key] = self._decode(immutable=False, unshared=True)
+                with self.immutable_value, self.disable_value_sharing:
+                    key = self._decode()
+                with self.disable_value_sharing:
+                    dictionary[key] = self._decode()
 
         if self.object_hook:
             dictionary = self._object_hook(self, dictionary)
@@ -244,7 +251,8 @@ cdef class CBORDecoder:
         if semantic_decoder:
             return semantic_decoder(self)
         else:
-            tag = CBORTag(tagnum, self._decode(immutable=False, unshared=True))
+            with self.disable_value_sharing:
+                tag = CBORTag(tagnum, self._decode())
             if self.tag_hook:
                 return self.tag_hook(tag)
             else:
@@ -359,9 +367,11 @@ cdef class CBORDecoder:
     def decode_set(self):
         # Semantic tag 258
         if self.immutable:
-            return frozenset(self._decode(immutable=True))
+            with self.immutable_value:
+                return frozenset(self._decode())
         else:
-            return set(self._decode(immutable=True))
+            with self.immutable_value:
+                return set(self._decode())
 
     def decode_ipaddress(self):
         # Semantic tag 260
@@ -392,22 +402,33 @@ cdef class CBORDecoder:
     def decode_float64(self):
         return struct.unpack('>d', self._read(8))[0]
 
-    cdef object _decode(self, bint immutable=False, bint unshared=False):
-        cdef int initial_byte
+    cdef object _decode(self):
+        cdef unsigned char initial_byte
 
-        if immutable:
-            old_immutable = self._immutable
-            self._immutable = True
-        if unshared:
-            old_index = self._share_index
-            self._share_index = -1
         initial_byte = self._read(1)[0]
-        result = major_decoders[initial_byte >> 5](self, initial_byte & 31)
-        if unshared:
-            self._share_index = old_index
-        if immutable:
-            self._immutable = old_immutable
-        return result
+        return major_decoders[initial_byte >> 5](self, initial_byte & 31)
+
+    @contextmanager
+    def disable_value_sharing(self):
+        """
+        Disable value sharing in the decoder for the duration of the context
+        block.
+        """
+        old_index = self._share_index
+        self._share_index = -1
+        yield
+        self._share_index = old_index
+
+    @contextmanager
+    def immutable_value(self):
+        """
+        Ensure the enclosed value is decoded as an immutable value (e.g. a
+        tuple instead of a list, a frozenset instead of a set).
+        """
+        old_immutable = self._immutable
+        self._immutable = True
+        yield
+        self._immutable = old_immutable
 
     def decode(self):
         """
